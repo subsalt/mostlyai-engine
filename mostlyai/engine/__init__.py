@@ -24,10 +24,11 @@ from mostlyai.engine._tabular.tensor_utils import (
     slice_sequences,
 )
 from mostlyai.engine._tabular.training import ModelConfig
+from mostlyai.engine._artifact import ModelArtifact, minimize_stats
 from mostlyai.engine.analysis import analyze
 from mostlyai.engine.encoding import encode
-from mostlyai.engine.generation import generate
-from mostlyai.engine.logging import init_logging
+from mostlyai.engine.generation import generate, generate_flat, generate_sequential
+from mostlyai.engine._logging import init_logging
 from mostlyai.engine.random_state import set_random_state
 from mostlyai.engine.splitting import split
 from mostlyai.engine.training import train
@@ -50,6 +51,11 @@ __all__ = [
     "prepare_flat_batch",
     "prepare_sequential_batch",
     "slice_sequences",
+    # Artifact-based generation (in-memory, no disk I/O)
+    "ModelArtifact",
+    "minimize_stats",
+    "generate_flat",
+    "generate_sequential",
 ]
 __version__ = "2.3.3"
 

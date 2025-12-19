@@ -52,7 +52,7 @@ from mostlyai.engine.domain import (
 )
 from mostlyai.engine.encoding import encode
 from mostlyai.engine.generation import generate
-from mostlyai.engine.logging import disable_logging, init_logging
+from mostlyai.engine._logging import disable_logging, init_logging
 from mostlyai.engine.splitting import split
 from mostlyai.engine.training import train
 

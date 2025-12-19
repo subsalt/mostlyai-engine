@@ -283,3 +283,171 @@ class ModelArtifact:
             f"weights={weights_size:,} bytes"
             f")"
         )
+
+
+# =============================================================================
+# Stats Minimization Functions
+# =============================================================================
+
+# Fields to REMOVE from column stats (not needed for encoding/decoding)
+_REMOVABLE_FIELDS = {
+    "value_protection",      # Privacy flag - not needed
+    "no_of_rare_categories", # Stats only - not needed for encoding
+    "cnt_values",            # Raw counts - only for value protection
+}
+
+# Fields to keep for each encoding type
+_ESSENTIAL_FIELDS_BY_TYPE = {
+    # Common fields needed by all types
+    "_common": {
+        "encoding_type",
+        "cardinalities",
+        "argn_processor",
+        "argn_table",
+        "argn_column",
+    },
+    # Categorical
+    "TABULAR_CATEGORICAL": {
+        "codes",  # Value -> int mapping
+    },
+    # Numeric discrete (each unique value is a category)
+    "TABULAR_NUMERIC_DISCRETE": {
+        "codes",
+        "min_decimal",  # For dtype conversion
+    },
+    # Numeric binned
+    "TABULAR_NUMERIC_BINNED": {
+        "codes",        # Special tokens (UNK, MIN, MAX)
+        "bins",         # Bin edges
+        "min_decimal",  # Decimal precision
+    },
+    # Numeric digit (digit-by-digit encoding)
+    "TABULAR_NUMERIC_DIGIT": {
+        "has_nan",
+        "has_neg",
+        "min_digits",   # Per-digit min values
+        "max_digits",   # Per-digit max values
+        "min_decimal",  # Precision range
+        "max_decimal",
+        "min",          # Value range for clipping
+        "max",
+    },
+    # Datetime
+    "TABULAR_DATETIME": {
+        "has_nan",
+        "has_time",
+        "has_ms",
+        "min_values",  # Per-component min
+        "max_values",  # Per-component max
+        "min",         # Overall min date string
+        "max",         # Overall max date string
+    },
+    # Relative datetime (inter-transaction time)
+    "TABULAR_DATETIME_RELATIVE": {
+        "has_nan",
+        "min_decimal",
+        "max_decimal",
+        "bins",
+        "codes",
+    },
+    # Character (character-level encoding)
+    "TABULAR_CHARACTER": {
+        "charset",
+        "max_len",
+        "codes",
+    },
+    # Lat/Long
+    "TABULAR_LAT_LONG": {
+        "precision",
+        "min_lat", "max_lat",
+        "min_long", "max_long",
+    },
+}
+
+
+def minimize_column_stats(column_stats: dict[str, Any]) -> dict[str, Any]:
+    """
+    Extract only the fields needed for encoding/decoding from column stats.
+
+    Removes value protection metadata, raw counts, and other training-only fields.
+
+    Args:
+        column_stats: Full column statistics dict from analyze()
+
+    Returns:
+        Minimized column statistics with only essential fields
+    """
+    encoding_type = column_stats.get("encoding_type", "")
+
+    # Start with common fields
+    essential_fields = set(_ESSENTIAL_FIELDS_BY_TYPE["_common"])
+
+    # Add type-specific fields
+    if encoding_type in _ESSENTIAL_FIELDS_BY_TYPE:
+        essential_fields |= _ESSENTIAL_FIELDS_BY_TYPE[encoding_type]
+
+    # Build minimized stats
+    minimal: dict[str, Any] = {}
+    for key, value in column_stats.items():
+        # Skip explicitly removable fields
+        if key in _REMOVABLE_FIELDS:
+            continue
+
+        # Include if it's an essential field or we don't know about this encoding type
+        # (better to include unknown fields than break decoding)
+        if key in essential_fields or encoding_type not in _ESSENTIAL_FIELDS_BY_TYPE:
+            # Special handling for seq_len - only keep min/max/median
+            if key == "seq_len" and isinstance(value, dict):
+                minimal[key] = {
+                    k: v for k, v in value.items()
+                    if k in ("min", "max", "median")
+                }
+            else:
+                minimal[key] = value
+
+    return minimal
+
+
+def minimize_stats(full_stats: dict[str, Any]) -> dict[str, Any]:
+    """
+    Minimize full stats dict (as returned by analyze()).
+
+    Keeps only what's needed for encoding/decoding, stripping privacy-related
+    and training-only metadata.
+
+    Args:
+        full_stats: Full statistics dict from analyze()
+
+    Returns:
+        Minimized statistics dict
+
+    Example:
+        >>> full_stats = workspace.tgt_stats.read()
+        >>> minimal = minimize_stats(full_stats)
+        >>> # minimal is ~30-50% smaller and contains only essential fields
+    """
+    minimal: dict[str, Any] = {}
+
+    # Minimize each column's stats
+    if "columns" in full_stats:
+        minimal["columns"] = {
+            col_name: minimize_column_stats(col_stats)
+            for col_name, col_stats in full_stats["columns"].items()
+        }
+
+    # Keep sequence length info (for sequential models)
+    if "seq_len" in full_stats:
+        minimal["seq_len"] = {
+            k: v for k, v in full_stats["seq_len"].items()
+            if k in ("min", "max", "median")
+        }
+
+    # Keep key column names
+    if "keys" in full_stats:
+        minimal["keys"] = full_stats["keys"]
+
+    # Keep is_sequential flag
+    if "is_sequential" in full_stats:
+        minimal["is_sequential"] = full_stats["is_sequential"]
+
+    return minimal
