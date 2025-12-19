@@ -91,8 +91,9 @@ def split(
         tgt_encoding_types: Encoding types for columns in the target data (excluding key columns).
         ctx_encoding_types: Encoding types for columns in the context data (excluding key columns).
         n_partitions: Number of partitions to split the data into.
-        trn_val_split: Fraction of data to use for training (0 < value < 1), or a callable
-            that takes keys as input and returns (trn_keys, val_keys) tuple.
+        trn_val_split: Fraction of data to use for training (0 < value <= 1), or a callable
+            that takes keys as input and returns (trn_keys, val_keys) tuple. Use 1.0 when
+            train/val splitting is handled externally (e.g., by Ray Data).
         workspace_dir: Path to the workspace directory where files will be created.
         update_progress: A custom progress callback.
     """
@@ -181,7 +182,8 @@ def split(
             # shuffle keys
             keys = keys.sample(frac=1)
             # split randomly into trn and val
-            assert 0 < trn_val_split < 1, f"invalid trn_val_split: {trn_val_split}"
+            # Allow 1.0 for cases where train/val split is handled externally (e.g., Ray Data)
+            assert 0 < trn_val_split <= 1, f"invalid trn_val_split: {trn_val_split}"
             trn_cnt = round(trn_val_split * len(keys))
             trn_keys = keys[:trn_cnt]
             val_keys = keys[trn_cnt:]
