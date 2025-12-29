@@ -982,22 +982,29 @@ def generate_sequential_core(
             include_mask = _compute_sequence_continue_mask(out_df, n_seed_steps)
             next_step_size = include_mask.sum()
 
-            # Store results
+            # Filter for next iteration (must happen BEFORE storing results to match legacy behavior)
+            # The include_mask determines which sequences should CONTINUE to the next step.
+            # Sequences with RIDX=0 have completed and should NOT be included in this step's output.
+            if step_size > next_step_size or next_step_size == 0:
+                step_size = next_step_size
+                step_ctx_keys = step_ctx_keys[include_mask.values].reset_index(drop=True)
+                out_df = out_df[include_mask.values].reset_index(drop=True)
+                out_pt = out_pt[include_mask.values, ...]
+                if len(seed_step) > 0:
+                    seed_step = seed_step[seed_step[tgt_context_key].isin(step_ctx_keys)].reset_index(drop=True)
+                if step_size > 0:
+                    context, history, history_state = _filter_sequence_state(
+                        include_mask, context, history, history_state
+                    )
+
+            # Store results AFTER filtering (to exclude sequences that ended this step)
             all_step_tensors.append(out_pt)
             all_step_keys.append(step_ctx_keys)
             all_seed_dfs.append(seed_step.reset_index(drop=True) if len(seed_step) > 0 else pd.DataFrame())
 
-            # Filter for next iteration
-            if step_size > next_step_size or next_step_size == 0:
-                step_size = next_step_size
-                if step_size == 0:
-                    break
-                step_ctx_keys = step_ctx_keys[include_mask.values].reset_index(drop=True)
-                out_df = out_df[include_mask.values].reset_index(drop=True)
-                out_pt = out_pt[include_mask.values, ...]
-                context, history, history_state = _filter_sequence_state(
-                    include_mask, context, history, history_state
-                )
+            # Exit if no sequences remain
+            if step_size == 0:
+                break
 
     # Combine and decode all results
     if len(all_step_tensors) == 0:
