@@ -474,6 +474,7 @@ def _encode_sequential_to_tensors(
                 seq = group[col].to_numpy()
                 seq_len = min(len(seq), max_seq_len)
                 padded[i, :seq_len, 0] = torch.tensor(seq[:seq_len], dtype=torch.int64, device=device)
+                # Position seq_len is the padding row (already 0 from initialization)
             except KeyError:
                 pass  # Empty sequence
 
@@ -494,6 +495,17 @@ def _encode_sequential_to_tensors(
     # - ridx (reverse index): Position from end of sequence (counts down to 0)
     #   Helps model learn end-of-sequence patterns (e.g., "2 items left")
     #
+    # IMPORTANT: The original implementation adds a padding row to each sequence
+    # (via pad_tgt_sequences), then computes positional columns INCLUDING the padding row.
+    # For a sequence of length N:
+    #   - After padding: N+1 rows
+    #   - sidx = [0, 1, 2, ..., N-1, N]  (N+1 values)
+    #   - slen = [N, N, N, ..., N, N]    (all equal to original length)
+    #   - ridx = [N, N-1, N-2, ..., 1, 0] (N+1 values, padding row has ridx=0)
+    #
+    # The padding row (with sidx=N, slen=N, ridx=0, and data=0) teaches the model
+    # to recognize end-of-sequence.
+    #
     # Encoding format depends on max_seq_len:
     # - For short sequences (< 100): Single categorical column (e.g., tgt:/__sidx_cat)
     # - For long sequences (>= 100): Digit encoding (e.g., tgt:/__sidx_E0, tgt:/__sidx_E1)
@@ -510,12 +522,16 @@ def _encode_sequential_to_tensors(
             seq_len = min(actual_len, max_seq_len)
 
             if seq_len > 0:
-                # sidx: 0, 1, 2, ... (position from start)
-                sidx_tensor[i, :seq_len, 0] = torch.arange(seq_len, dtype=torch.int64, device=device)
-                # slen: sequence length for all positions (note: original uses len-1 to account for padding)
-                slen_tensor[i, :seq_len, 0] = seq_len - 1
-                # ridx: seq_len-1, seq_len-2, ..., 0 (position from end)
-                ridx_tensor[i, :seq_len, 0] = torch.arange(seq_len - 1, -1, -1, dtype=torch.int64, device=device)
+                # Include the padding row at position seq_len
+                # Total positions filled: seq_len + 1 (indices 0 through seq_len inclusive)
+                padded_len = seq_len + 1
+
+                # sidx: 0, 1, 2, ..., seq_len (position from start, including padding row)
+                sidx_tensor[i, :padded_len, 0] = torch.arange(padded_len, dtype=torch.int64, device=device)
+                # slen: original sequence length for all positions (including padding row)
+                slen_tensor[i, :padded_len, 0] = seq_len
+                # ridx: seq_len, seq_len-1, ..., 1, 0 (padding row has ridx=0)
+                ridx_tensor[i, :padded_len, 0] = torch.arange(seq_len, -1, -1, dtype=torch.int64, device=device)
 
         tensors[f"{SIDX_SUB_COLUMN_PREFIX}cat"] = sidx_tensor
         tensors[f"{SLEN_SUB_COLUMN_PREFIX}cat"] = slen_tensor
@@ -539,14 +555,17 @@ def _encode_sequential_to_tensors(
                 seq_len = min(actual_len, max_seq_len)
 
                 if seq_len > 0:
-                    sidx_vals = torch.arange(seq_len, dtype=torch.int64, device=device)
-                    slen_val = seq_len - 1  # -1 to match original implementation
-                    ridx_vals = torch.arange(seq_len - 1, -1, -1, dtype=torch.int64, device=device)
+                    # Include the padding row at position seq_len
+                    padded_len = seq_len + 1
+
+                    sidx_vals = torch.arange(padded_len, dtype=torch.int64, device=device)
+                    slen_val = seq_len  # original sequence length
+                    ridx_vals = torch.arange(seq_len, -1, -1, dtype=torch.int64, device=device)
 
                     # Extract the digit at this position: (value // 10^exp) % 10
-                    sidx_tensor[i, :seq_len, 0] = (sidx_vals // divisor) % 10
-                    slen_tensor[i, :seq_len, 0] = (slen_val // divisor) % 10
-                    ridx_tensor[i, :seq_len, 0] = (ridx_vals // divisor) % 10
+                    sidx_tensor[i, :padded_len, 0] = (sidx_vals // divisor) % 10
+                    slen_tensor[i, :padded_len, 0] = (slen_val // divisor) % 10
+                    ridx_tensor[i, :padded_len, 0] = (ridx_vals // divisor) % 10
 
             tensors[f"{SIDX_SUB_COLUMN_PREFIX}E{exp}"] = sidx_tensor
             tensors[f"{SLEN_SUB_COLUMN_PREFIX}E{exp}"] = slen_tensor
