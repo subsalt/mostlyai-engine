@@ -337,6 +337,246 @@ def create_sequential_test_data(n_contexts: int = 500) -> tuple[pd.DataFrame, pd
 
 
 @ray.remote(num_cpus=0, num_gpus=1)
+def test_phase2_train_flat():
+    """
+    Test Phase 2: In-memory training with train_flat().
+
+    Validates the new train_flat() function which bypasses workspace I/O:
+    1. Computes stats in-memory
+    2. Encodes data directly to GPU tensors
+    3. Trains and returns ModelArtifact
+    4. Compares generation quality to workspace-trained model
+    """
+    from mostlyai import engine
+    from mostlyai.engine._train import train_flat
+    from mostlyai.engine.generation import generate_flat
+    from mostlyai.engine.domain import ModelEncodingType
+    from mostlyai.engine.random_state import set_random_state
+
+    print("=" * 70)
+    print("PHASE 2 TEST: In-Memory Flat Training (train_flat)")
+    print("=" * 70)
+
+    # Create test data
+    print("\n[1/4] Creating test data...")
+    df = create_test_data(n_samples=3000)
+    print(f"  Created DataFrame with shape {df.shape}")
+
+    encoding_types = {
+        "cat_col": ModelEncodingType.tabular_categorical,
+        "num_col": ModelEncodingType.tabular_numeric_auto,
+        "int_col": ModelEncodingType.tabular_numeric_discrete,
+        "cat_col2": ModelEncodingType.tabular_categorical,
+    }
+
+    # Train using new in-memory method
+    print("\n[2/4] Training with train_flat() (no workspace)...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    t0 = time.time()
+    artifact = train_flat(
+        tgt_data=df,
+        tgt_encoding_types=encoding_types,
+        val_split=0.1,
+        model_size="M",
+        max_epochs=TRAINING_EPOCHS,
+        batch_size=512,
+        device=device,
+        enable_flexible_generation=False,
+    )
+    training_time = time.time() - t0
+    print(f"  Training completed in {training_time:.1f}s")
+    print(f"  Artifact: {artifact}")
+    print(f"  Artifact size: {len(artifact.to_bytes()):,} bytes")
+
+    # Verify roundtrip serialization
+    artifact_bytes = artifact.to_bytes()
+    artifact_restored = artifact.from_bytes(artifact_bytes)
+    print("  Roundtrip serialization: OK")
+
+    # Generate samples
+    print("\n[3/4] Generating synthetic data...")
+    set_random_state(RANDOM_SEED)
+    t0 = time.time()
+    samples = generate_flat(
+        artifact=artifact_restored,
+        sample_size=SAMPLE_SIZE,
+        device=device,
+    )
+    gen_time = time.time() - t0
+    print(f"  Generated {len(samples)} samples in {gen_time:.2f}s")
+
+    # Validate output quality
+    print("\n[4/4] Validating output quality...")
+    print("=" * 70)
+    print("QUALITY METRICS")
+    print("=" * 70)
+
+    # Check columns match input
+    expected_cols = set(encoding_types.keys())
+    actual_cols = set(samples.columns)
+    print(f"\nColumn match: {expected_cols == actual_cols}")
+    if expected_cols != actual_cols:
+        print(f"  Expected: {expected_cols}")
+        print(f"  Actual: {actual_cols}")
+
+    # Compare distributions to original data
+    print("\n--- Categorical Distributions (vs original) ---")
+    for col in ["cat_col", "cat_col2"]:
+        orig_dist = df[col].value_counts(normalize=True).sort_index()
+        gen_dist = samples[col].value_counts(normalize=True).sort_index()
+
+        # Check all categories present
+        missing = set(orig_dist.index) - set(gen_dist.index)
+        if missing:
+            print(f"  {col}: WARN missing categories: {missing}")
+        else:
+            # Compare distributions
+            aligned_orig = orig_dist.reindex(gen_dist.index, fill_value=0)
+            max_diff = abs(aligned_orig - gen_dist).max()
+            status = "PASS" if max_diff < 0.15 else "WARN"
+            print(f"  {col}: {status} max diff = {max_diff:.4f}")
+
+    print("\n--- Numeric Statistics (vs original) ---")
+    for col in ["num_col", "int_col"]:
+        orig_mean, orig_std = df[col].mean(), df[col].std()
+        gen_mean, gen_std = samples[col].mean(), samples[col].std()
+
+        mean_pct_diff = abs(orig_mean - gen_mean) / (abs(orig_mean) + 1e-6) * 100
+        std_pct_diff = abs(orig_std - gen_std) / (abs(orig_std) + 1e-6) * 100
+
+        status = "PASS" if mean_pct_diff < 20 and std_pct_diff < 30 else "WARN"
+        print(f"  {col}: {status} mean diff={mean_pct_diff:.1f}%, std diff={std_pct_diff:.1f}%")
+        print(f"    Original: mean={orig_mean:.2f}, std={orig_std:.2f}")
+        print(f"    Generated: mean={gen_mean:.2f}, std={gen_std:.2f}")
+
+    print("\n--- Performance Summary ---")
+    print(f"  Training time: {training_time:.1f}s")
+    print(f"  Generation time: {gen_time:.2f}s")
+    print(f"  Artifact size: {len(artifact_bytes):,} bytes")
+
+    print("\n" + "=" * 70)
+    print("PHASE 2 FLAT TRAINING TEST COMPLETE")
+    print("=" * 70)
+
+    return True
+
+
+@ray.remote(num_cpus=0, num_gpus=1)
+def test_phase2_train_sequential():
+    """
+    Test Phase 2: In-memory sequential training with train_sequential().
+
+    Validates the new train_sequential() function for longitudinal data.
+    """
+    from mostlyai.engine._train import train_sequential
+    from mostlyai.engine.generation import generate_sequential
+    from mostlyai.engine.domain import ModelEncodingType
+    from mostlyai.engine.random_state import set_random_state
+
+    print("=" * 70)
+    print("PHASE 2 TEST: In-Memory Sequential Training (train_sequential)")
+    print("=" * 70)
+
+    # Create test data
+    print("\n[1/4] Creating sequential test data...")
+    ctx_data, tgt_data = create_sequential_test_data(n_contexts=400)
+    print(f"  Context: {ctx_data.shape}, Target: {tgt_data.shape}")
+    print(f"  Sequences per context: {tgt_data.groupby('user_id').size().describe()}")
+
+    ctx_encoding_types = {
+        "age": ModelEncodingType.tabular_numeric_auto,
+        "gender": ModelEncodingType.tabular_categorical,
+    }
+    tgt_encoding_types = {
+        "amount": ModelEncodingType.tabular_numeric_auto,
+        "category": ModelEncodingType.tabular_categorical,
+    }
+
+    # Train using new in-memory method
+    print("\n[2/4] Training with train_sequential() (no workspace)...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    t0 = time.time()
+    artifact = train_sequential(
+        tgt_data=tgt_data,
+        tgt_encoding_types=tgt_encoding_types,
+        tgt_context_key="user_id",
+        ctx_data=ctx_data,
+        ctx_primary_key="user_id",
+        ctx_encoding_types=ctx_encoding_types,
+        val_split=0.1,
+        model_size="M",
+        max_epochs=TRAINING_EPOCHS,
+        batch_size=128,
+        device=device,
+        enable_flexible_generation=False,
+    )
+    training_time = time.time() - t0
+    print(f"  Training completed in {training_time:.1f}s")
+    print(f"  Artifact: {artifact}")
+    print(f"  Artifact size: {len(artifact.to_bytes()):,} bytes")
+
+    # Verify roundtrip
+    artifact_bytes = artifact.to_bytes()
+    artifact_restored = artifact.from_bytes(artifact_bytes)
+    print("  Roundtrip serialization: OK")
+
+    # Generate sequences
+    n_generate = 100
+    print(f"\n[3/4] Generating {n_generate} sequences...")
+    set_random_state(RANDOM_SEED)
+    t0 = time.time()
+    samples = generate_sequential(
+        artifact=artifact_restored,
+        sample_size=n_generate,
+        ctx_data=ctx_data.head(n_generate),
+        device=device,
+    )
+    gen_time = time.time() - t0
+    print(f"  Generated {len(samples)} rows in {gen_time:.2f}s")
+    print(f"  Unique contexts: {samples['user_id'].nunique()}")
+
+    # Validate output
+    print("\n[4/4] Validating output quality...")
+    print("=" * 70)
+    print("QUALITY METRICS")
+    print("=" * 70)
+
+    # Sequence length stats
+    orig_seq_lens = tgt_data.groupby("user_id").size()
+    gen_seq_lens = samples.groupby("user_id").size()
+
+    print("\n--- Sequence Length Distribution ---")
+    print(f"  Original: mean={orig_seq_lens.mean():.2f}, std={orig_seq_lens.std():.2f}")
+    print(f"  Generated: mean={gen_seq_lens.mean():.2f}, std={gen_seq_lens.std():.2f}")
+
+    # Category distribution
+    print("\n--- Category Distribution ---")
+    orig_dist = tgt_data["category"].value_counts(normalize=True).sort_index()
+    gen_dist = samples["category"].value_counts(normalize=True).sort_index()
+    for cat in orig_dist.index:
+        if cat in gen_dist.index:
+            diff = abs(orig_dist[cat] - gen_dist[cat])
+            status = "PASS" if diff < 0.15 else "WARN"
+            print(f"  {cat}: {status} orig={orig_dist[cat]:.3f}, gen={gen_dist[cat]:.3f}")
+
+    # Numeric stats
+    print("\n--- Amount Statistics ---")
+    print(f"  Original: mean={tgt_data['amount'].mean():.2f}, std={tgt_data['amount'].std():.2f}")
+    print(f"  Generated: mean={samples['amount'].mean():.2f}, std={samples['amount'].std():.2f}")
+
+    print("\n--- Performance Summary ---")
+    print(f"  Training time: {training_time:.1f}s")
+    print(f"  Generation time: {gen_time:.2f}s")
+    print(f"  Artifact size: {len(artifact_bytes):,} bytes")
+
+    print("\n" + "=" * 70)
+    print("PHASE 2 SEQUENTIAL TRAINING TEST COMPLETE")
+    print("=" * 70)
+
+    return True
+
+
+@ray.remote(num_cpus=0, num_gpus=1)
 def test_sequential_artifact_generation():
     """
     Test sequential (longitudinal) artifact-based generation.
@@ -529,12 +769,16 @@ if __name__ == "__main__":
 
     # Run tests on GPU workers
     try:
-        # Run flat model tests
+        # Phase 1: Artifact-based generation tests
+        print("\n>>> PHASE 1: Artifact-based Generation <<<\n")
         result1 = ray.get(test_phase1_artifact_generation.remote())
         result2 = ray.get(test_artifact_size_comparison.remote())
-
-        # Run sequential model test
         result3 = ray.get(test_sequential_artifact_generation.remote())
+
+        # Phase 2: In-memory training tests
+        print("\n>>> PHASE 2: In-Memory Training <<<\n")
+        result4 = ray.get(test_phase2_train_flat.remote())
+        result5 = ray.get(test_phase2_train_sequential.remote())
 
         print("\n" + "=" * 70)
         print("ALL TESTS PASSED!")

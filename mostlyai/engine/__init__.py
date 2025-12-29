@@ -25,6 +25,8 @@ from mostlyai.engine._tabular.tensor_utils import (
 )
 from mostlyai.engine._tabular.training import ModelConfig
 from mostlyai.engine._artifact import ModelArtifact, minimize_stats
+from mostlyai.engine._stats import compute_stats
+from mostlyai.engine._train import train_flat, train_sequential
 from mostlyai.engine.analysis import analyze
 from mostlyai.engine.encoding import encode
 from mostlyai.engine.generation import generate, generate_flat, generate_sequential
@@ -51,9 +53,12 @@ __all__ = [
     "prepare_flat_batch",
     "prepare_sequential_batch",
     "slice_sequences",
-    # Artifact-based generation (in-memory, no disk I/O)
+    # Artifact-based API (in-memory, no disk I/O)
     "ModelArtifact",
     "minimize_stats",
+    "compute_stats",
+    "train_flat",
+    "train_sequential",
     "generate_flat",
     "generate_sequential",
 ]
