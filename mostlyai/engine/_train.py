@@ -1,11 +1,14 @@
 """
 High-performance in-memory training functions.
 
-This module provides training functions optimized for the case where the full
-dataset fits in memory. Key optimizations:
-1. Stats computed once upfront
-2. Full dataset encoded to GPU tensors once
-3. Efficient batching from pre-loaded tensors (no per-batch CPU overhead)
+This module provides training functions optimized for efficient GPU utilization:
+1. Stats computed once upfront (single pass over data)
+2. Full dataset encoded to CPU tensors once (no per-batch encoding overhead)
+3. Batches transferred to GPU on-demand (VRAM-safe for large datasets)
+4. Non-blocking transfers for overlapped computation
+
+The encode-once-on-CPU, transfer-per-batch design allows training on datasets
+larger than GPU memory while avoiding repeated encoding overhead.
 """
 
 import json
@@ -109,10 +112,11 @@ def train_flat(
 
     _LOG.info(f"Split: {n_train} training, {n_val} validation samples")
 
-    # Step 3: Encode full datasets to tensors (single encoding pass, directly to GPU)
+    # Step 3: Encode full datasets to tensors on CPU (single encoding pass)
+    # Tensors are kept on CPU to avoid VRAM exhaustion; batches are moved to GPU on demand
     _LOG.info("Encoding to tensors...")
-    train_tensors = _encode_df_to_tensors(train_df, tgt_stats, device)
-    val_tensors = _encode_df_to_tensors(val_df, tgt_stats, device)
+    train_tensors = _encode_df_to_tensors(train_df, tgt_stats, torch.device("cpu"))
+    val_tensors = _encode_df_to_tensors(val_df, tgt_stats, torch.device("cpu"))
 
     # Step 4: Build model config
     tgt_cardinalities = get_cardinalities(tgt_stats)
@@ -132,14 +136,20 @@ def train_flat(
     if batch_size is None:
         batch_size = min(n_train, 2048)
 
-    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, shuffle: bool = False):
-        """Create iterator over batches from pre-loaded tensors."""
+    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False):
+        """Create iterator over batches from pre-loaded CPU tensors.
+
+        Tensors are stored on CPU and moved to GPU per-batch to avoid VRAM exhaustion.
+        This allows training on datasets larger than GPU memory while still benefiting
+        from single-pass encoding.
+        """
         n = next(iter(tensor_dict.values())).shape[0]
         indices = np.random.permutation(n) if shuffle else np.arange(n)
         for start in range(0, n, batch_sz):
             end = min(start + batch_sz, n)
             batch_indices = indices[start:end]
-            yield {k: v[batch_indices] for k, v in tensor_dict.items()}
+            # Move only this batch to target device (GPU)
+            yield {k: v[batch_indices].to(target_device, non_blocking=True) for k, v in tensor_dict.items()}
 
     # Step 6: Train using temporary workspace for model outputs
     with tempfile.TemporaryDirectory(prefix="train_flat_") as workspace_dir:
@@ -155,8 +165,8 @@ def train_flat(
         _LOG.info(f"Training for up to {max_epochs} epochs...")
 
         train_internal(
-            train_tensors=make_batch_iter(train_tensors, batch_size, shuffle=True),
-            val_tensors=make_batch_iter(val_tensors, batch_size, shuffle=False),
+            train_tensors=make_batch_iter(train_tensors, batch_size, device, shuffle=True),
+            val_tensors=make_batch_iter(val_tensors, batch_size, device, shuffle=False),
             model_config=model_config,
             workspace_dir=workspace_dir,
             model=f"MOSTLY_AI/{_model_size_name(model_size)}",
@@ -279,19 +289,21 @@ def train_sequential(
 
     _LOG.info(f"Split: {n_train} training, {n_val} validation contexts")
 
-    # Step 3: Encode to tensors
+    # Step 3: Encode to tensors on CPU (single encoding pass)
+    # Tensors are kept on CPU to avoid VRAM exhaustion; batches are moved to GPU on demand
     _LOG.info("Encoding to tensors...")
     seq_len_max = tgt_stats["seq_len"]["max"]
+    cpu_device = torch.device("cpu")
 
     train_tensors = _encode_sequential_to_tensors(
         train_tgt, tgt_stats, tgt_context_key,
         train_ctx, ctx_stats, ctx_primary_key,
-        seq_len_max, device,
+        seq_len_max, cpu_device,
     )
     val_tensors = _encode_sequential_to_tensors(
         val_tgt, tgt_stats, tgt_context_key,
         val_ctx, ctx_stats, ctx_primary_key,
-        seq_len_max, device,
+        seq_len_max, cpu_device,
     )
 
     # Step 4: Build model config
@@ -315,13 +327,20 @@ def train_sequential(
     if batch_size is None:
         batch_size = min(n_train, 512)
 
-    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, shuffle: bool = False):
+    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False):
+        """Create iterator over batches from pre-loaded CPU tensors.
+
+        Tensors are stored on CPU and moved to GPU per-batch to avoid VRAM exhaustion.
+        This allows training on datasets larger than GPU memory while still benefiting
+        from single-pass encoding.
+        """
         n = next(iter(tensor_dict.values())).shape[0]
         indices = np.random.permutation(n) if shuffle else np.arange(n)
         for start in range(0, n, batch_sz):
             end = min(start + batch_sz, n)
             batch_indices = indices[start:end]
-            yield {k: v[batch_indices] for k, v in tensor_dict.items()}
+            # Move only this batch to target device (GPU)
+            yield {k: v[batch_indices].to(target_device, non_blocking=True) for k, v in tensor_dict.items()}
 
     # Step 6: Train
     with tempfile.TemporaryDirectory(prefix="train_seq_") as workspace_dir:
@@ -343,8 +362,8 @@ def train_sequential(
         _LOG.info(f"Training for up to {max_epochs} epochs...")
 
         train_internal(
-            train_tensors=make_batch_iter(train_tensors, batch_size, shuffle=True),
-            val_tensors=make_batch_iter(val_tensors, batch_size, shuffle=False),
+            train_tensors=make_batch_iter(train_tensors, batch_size, device, shuffle=True),
+            val_tensors=make_batch_iter(val_tensors, batch_size, device, shuffle=False),
             model_config=model_config,
             workspace_dir=workspace_dir,
             model=f"MOSTLY_AI/{_model_size_name(model_size)}",
