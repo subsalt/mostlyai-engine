@@ -58,7 +58,7 @@ def train_flat(
 
     Args:
         tgt_data: Target DataFrame for training
-        tgt_encoding_types: Dict mapping column names to encoding types
+        tgt_encoding_types: Dict mapping column names to encoding types (must not be empty)
         val_split: Fraction of data to use for validation (default: 0.1)
         model_size: Model size ("S", "M", "L")
         max_epochs: Maximum training epochs
@@ -69,6 +69,9 @@ def train_flat(
 
     Returns:
         ModelArtifact containing trained weights and stats
+
+    Raises:
+        ValueError: If tgt_encoding_types is empty (no columns to train on)
 
     Example:
         >>> from mostlyai.engine import train_flat, generate_flat
@@ -82,6 +85,13 @@ def train_flat(
         >>> synthetic = generate_flat(artifact, sample_size=1000)
     """
     from mostlyai.engine._tabular.training import train as train_internal
+
+    # Validate that we have columns to train on
+    if not tgt_encoding_types:
+        raise ValueError(
+            "tgt_encoding_types cannot be empty. At least one column must be specified for training. "
+            "If you have no columns to train on (e.g., only key columns), consider skipping this model."
+        )
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -218,11 +228,11 @@ def train_sequential(
 
     Args:
         tgt_data: Target DataFrame containing sequences
-        tgt_encoding_types: Dict mapping column names to encoding types
+        tgt_encoding_types: Dict mapping column names to encoding types (must not be empty)
         tgt_context_key: Column linking target rows to contexts
         ctx_data: Optional context DataFrame (one row per context)
         ctx_primary_key: Primary key column in context
-        ctx_encoding_types: Dict mapping context column names to encoding types
+        ctx_encoding_types: Dict mapping context column names to encoding types (can be None or empty)
         val_split: Fraction of contexts to use for validation
         model_size: Model size ("S", "M", "L")
         max_epochs: Maximum training epochs
@@ -233,6 +243,9 @@ def train_sequential(
 
     Returns:
         ModelArtifact containing trained weights and stats
+
+    Raises:
+        ValueError: If tgt_encoding_types is empty (no columns to train on)
 
     Example:
         >>> artifact = train_sequential(
@@ -246,12 +259,19 @@ def train_sequential(
     """
     from mostlyai.engine._tabular.training import train as train_internal
 
+    # Validate that we have target columns to train on
+    if not tgt_encoding_types:
+        raise ValueError(
+            "tgt_encoding_types cannot be empty. At least one target column must be specified for training."
+        )
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif isinstance(device, str):
         device = torch.device(device)
 
-    has_context = ctx_data is not None and ctx_encoding_types is not None
+    # Context is optional - treat empty dict same as None
+    has_context = ctx_data is not None and ctx_encoding_types
 
     # Count contexts
     context_ids = tgt_data[tgt_context_key].unique()
