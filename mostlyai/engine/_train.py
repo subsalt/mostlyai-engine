@@ -15,7 +15,6 @@ import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,11 +24,6 @@ from mostlyai.engine._artifact import ModelArtifact, minimize_stats
 from mostlyai.engine._common import get_cardinalities, get_ctx_sequence_length
 from mostlyai.engine._stats import compute_stats
 from mostlyai.engine._tabular.encoding import encode_df
-from mostlyai.engine._tabular.tensor_utils import (
-    build_model_config,
-    prepare_flat_batch,
-    prepare_sequential_batch,
-)
 from mostlyai.engine._tabular.training import ModelConfig
 from mostlyai.engine.domain import ModelEncodingType
 

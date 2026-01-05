@@ -10,7 +10,6 @@ import random
 import uuid
 from typing import Literal
 
-import numpy as np
 import pandas as pd
 import torch
 
