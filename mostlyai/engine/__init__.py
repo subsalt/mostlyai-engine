@@ -11,56 +11,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+MostlyAI Engine - Optimized for distributed cluster environments.
+
+This fork provides an in-memory API for training and generating synthetic data
+without workspace file I/O.
+
+Training:
+    >>> from mostlyai.engine import train_flat, train_sequential
+    >>> artifact = train_flat(df, encoding_types, max_epochs=100)
+    >>> artifact = train_sequential(events_df, encoding_types, ctx_data=users_df, ...)
+
+Generation:
+    >>> from mostlyai.engine import generate_flat, generate_sequential
+    >>> synthetic_df = generate_flat(artifact, sample_size=1000)
+    >>> synthetic_df = generate_sequential(artifact, sample_size=100)
+
+Serialization:
+    >>> artifact_bytes = artifact.to_bytes()  # Save to DB/object store
+    >>> artifact = ModelArtifact.from_bytes(artifact_bytes)  # Load back
+"""
 import warnings
 
-from mostlyai.engine._tabular.interface import TabularARGN
-from mostlyai.engine._tabular.tensor_utils import (
-    build_model_config,
-    build_model_config_from_workspace,
-    encode_batch,
-    load_tensors_from_workspace,
-    prepare_flat_batch,
-    prepare_sequential_batch,
-    slice_sequences,
-)
-from mostlyai.engine._tabular.training import ModelConfig
 from mostlyai.engine._artifact import ModelArtifact, minimize_stats
+from mostlyai.engine._logging import init_logging
 from mostlyai.engine._stats import compute_stats
 from mostlyai.engine._train import train_flat, train_sequential
-from mostlyai.engine.analysis import analyze
-from mostlyai.engine.encoding import encode
-from mostlyai.engine.generation import generate, generate_flat, generate_sequential
-from mostlyai.engine._logging import init_logging
+from mostlyai.engine.domain import ModelEncodingType
+from mostlyai.engine.generation import generate_flat, generate_sequential
 from mostlyai.engine.random_state import set_random_state
-from mostlyai.engine.splitting import split
-from mostlyai.engine.training import train
 
 __all__ = [
-    "split",
-    "analyze",
-    "encode",
-    "train",
-    "generate",
-    "init_logging",
-    "set_random_state",
-    "TabularARGN",
-    # Tensor interface for training optimization
-    "ModelConfig",
-    "build_model_config",
-    "build_model_config_from_workspace",
-    "encode_batch",
-    "load_tensors_from_workspace",
-    "prepare_flat_batch",
-    "prepare_sequential_batch",
-    "slice_sequences",
-    # Artifact-based API (in-memory, no disk I/O)
-    "ModelArtifact",
-    "minimize_stats",
-    "compute_stats",
+    # Core API
     "train_flat",
     "train_sequential",
     "generate_flat",
     "generate_sequential",
+    # Artifact
+    "ModelArtifact",
+    "minimize_stats",
+    "compute_stats",
+    # Types
+    "ModelEncodingType",
+    # Utilities
+    "init_logging",
+    "set_random_state",
 ]
 __version__ = "2.3.3"
 
