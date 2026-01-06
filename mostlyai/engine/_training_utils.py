@@ -156,9 +156,7 @@ class ModelCheckpoint(abc.ABC):
 
 
 def check_early_training_exit(workspace: Workspace, trn_cnt: int, val_cnt: int) -> bool:
-    trn_files = workspace.encoded_data_trn.fetch_all()
-    val_files = workspace.encoded_data_val.fetch_all()
-    return any((len(trn_files) == 0, len(val_files) == 0, trn_cnt == 0, val_cnt == 0))
+    return trn_cnt == 0 or val_cnt == 0
 
 
 def gpu_memory_cleanup(func):
