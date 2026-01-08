@@ -177,8 +177,6 @@ def split_sub_columns_digit(
 
     Each digit position (from max_decimal down to min_decimal) becomes a separate column.
     Also adds 'nan' and 'neg' indicator columns.
-
-    Uses vectorized NumPy operations for performance (10x+ faster than string-based).
     """
     if not is_integer_dtype(values) and not is_float_dtype(values):
         raise ValueError("expected to be numeric")
