@@ -18,7 +18,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from importlib.metadata import version
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -95,6 +95,21 @@ class ModelConfig(TypedDict, total=False):
 
     empirical_probs: dict[str, list[float]] | None
     """Empirical probabilities for predictor initialization (optional, improves convergence)"""
+
+
+class EpochInfo(TypedDict):
+    """Information passed to on_epoch callback after each training epoch."""
+
+    epoch: int
+    trn_loss: float | None
+    val_loss: float | None
+    lr: float
+    epoch_time: float
+    total_time: float
+    is_checkpoint: bool
+
+
+OnEpochCallback: TypeAlias = Callable[[EpochInfo], None]
 
 
 ##################
@@ -195,11 +210,9 @@ class _TensorIteratorWrapper:
 
 class TabularModelCheckpoint(ModelCheckpoint):
     def _save_model_weights(self, model: torch.nn.Module):
-        if isinstance(model, GradSampleModule):
-            state_dict = model._module.state_dict()
-        else:
-            state_dict = model.state_dict()
-        torch.save(state_dict, self.workspace.model_tabular_weights_path)
+        # torch.compile() wraps the model in OptimizedModule, storing the original at _orig_mod
+        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+        torch.save(unwrapped.state_dict(), self.workspace.model_tabular_weights_path)
 
     def _clear_model_weights(self) -> None:
         self.workspace.model_tabular_weights_path.unlink(missing_ok=True)
@@ -209,24 +222,23 @@ class TabularModelCheckpoint(ModelCheckpoint):
 
 
 def _calculate_sample_losses(
-    model: FlatModel | SequentialModel | GradSampleModule, data: dict[str, torch.Tensor]
+    model: FlatModel | SequentialModel, data: dict[str, torch.Tensor]
 ) -> torch.Tensor:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
         output, _ = model(data, mode="trn")
     criterion = nn.CrossEntropyLoss(reduction="none")
 
-    tgt_cols = (
-        list(model.tgt_cardinalities.keys())
-        if not isinstance(model, GradSampleModule)
-        else model._module.tgt_cardinalities.keys()
-    )
-    if isinstance(model, SequentialModel) or (
-        isinstance(model, GradSampleModule) and isinstance(model._module, SequentialModel)
-    ):
+    # torch.compile() wraps the model in OptimizedModule, storing the original at _orig_mod
+    unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+    tgt_cols = list(unwrapped.tgt_cardinalities.keys())
+
+    # Detect sequential vs flat by presence of RIDX columns in data
+    ridx_cols = [k for k in data if k.startswith(RIDX_SUB_COLUMN_PREFIX)]
+    is_sequential = len(ridx_cols) > 0
+    if is_sequential:
         sidx_cols = {k for k in data if k.startswith(SIDX_SUB_COLUMN_PREFIX)}
         slen_cols = {k for k in data if k.startswith(SLEN_SUB_COLUMN_PREFIX)}
-        ridx_cols = [k for k in data if k.startswith(RIDX_SUB_COLUMN_PREFIX)]
 
         # mask for data columns
         data_mask = torch.zeros_like(data[ridx_cols[0]], dtype=torch.int64)
@@ -268,13 +280,15 @@ def _calculate_val_loss(
     model: FlatModel | SequentialModel,
     val_dataloader: "_TensorIteratorWrapper",
     device: torch.device,
+    use_amp: bool = False,
 ) -> float:
     val_sample_losses: list[torch.Tensor] = []
     model.eval()
     for step_data in val_dataloader:
         # move batch to device (tensors may come from CPU)
         step_data = {k: v.to(device) if v.device != device else v for k, v in step_data.items()}
-        step_losses = _calculate_sample_losses(model, step_data)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            step_losses = _calculate_sample_losses(model, step_data)
         val_sample_losses.extend(step_losses.detach())
     model.train()
     val_sample_losses: torch.Tensor = torch.stack(val_sample_losses, dim=0)
@@ -317,6 +331,7 @@ def train(
     model_state_strategy: ModelStateStrategy | str = ModelStateStrategy.reset,
     device: torch.device | str | None = None,
     update_progress: ProgressCallback | None = None,
+    on_epoch: OnEpochCallback | None = None,
 ):
     """
     Train a TabularARGN model from pre-computed tensor batches.
@@ -340,6 +355,7 @@ def train(
         model_state_strategy: How to handle existing model state
         device: Device for training (auto-detected if None)
         update_progress: Progress callback
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Example:
         >>> from mostlyai.engine import train, build_model_config, prepare_flat_batch
@@ -455,6 +471,10 @@ def train(
         else:
             argn = FlatModel(**model_kwargs)
         _LOG.info(f"model class: {argn.__class__.__name__}")
+
+        # Compile model for faster execution via kernel fusion
+        if device.type == "cuda":
+            argn = torch.compile(argn)
 
         if isinstance(model_state_strategy, str):
             model_state_strategy = ModelStateStrategy(model_state_strategy)
@@ -588,8 +608,13 @@ def train(
             # this can help accelerate GPU compute
             torch.backends.cudnn.benchmark = True
 
+        # Mixed precision training for faster GPU compute
+        use_amp = device.type == "cuda"
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+
         progress_message = None
         start_trn_time = time.time()
+        epoch_start_time = time.time()
         last_msg_time = time.time()
         trn_data_iter = iter(trn_dataloader)
         trn_sample_losses: list[torch.Tensor] = []
@@ -614,22 +639,24 @@ def train(
                     step_data = next(trn_data_iter)
                 # move batch to device (tensors may come from CPU)
                 step_data = {k: v.to(device) if v.device != device else v for k, v in step_data.items()}
-                # forward pass + calculate sample losses
-                step_losses = _calculate_sample_losses(argn, step_data)
-                # FIXME in sequential case, this is an approximation, it should be divided by total sum of masks in the
-                #  entire batch to get the average loss per sample. Less importantly the final sample may be smaller
-                #  than the batch size in both flat and sequential case.
-                # calculate total step loss
-                step_loss = torch.mean(step_losses) / gradient_accumulation_steps
-                # backward pass
+                # forward pass + calculate sample losses (with mixed precision)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    step_losses = _calculate_sample_losses(argn, step_data)
+                    # FIXME in sequential case, this is an approximation, it should be divided by total sum of masks in the
+                    #  entire batch to get the average loss per sample. Less importantly the final sample may be smaller
+                    #  than the batch size in both flat and sequential case.
+                    # calculate total step loss
+                    step_loss = torch.mean(step_losses) / gradient_accumulation_steps
+                # backward pass (with gradient scaling for mixed precision)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
-                    step_loss.backward()
+                    scaler.scale(step_loss).backward()
                 accumulated_steps += 1
                 samples += step_losses.shape[0]
                 if accumulated_steps % gradient_accumulation_steps == 0:
                     # update parameters with accumulated gradients
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     stop_accumulating_grads = True
                 # detach losses from the graph
                 step_losses = step_losses.detach()
@@ -647,7 +674,7 @@ def train(
             do_validation = on_epoch_end = epoch.is_integer()
             if do_validation:
                 # calculate val loss and trn loss
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, device=device)
+                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, device=device, use_amp=use_amp)
                 # handle scenario where model training ran into numeric instability
                 if pd.isna(val_loss):
                     _LOG.warning("validation loss is not available - reset model weights to last checkpoint")
@@ -666,6 +693,7 @@ def train(
                     dp_accountant=None,
                 )
                 # gather message for progress with checkpoint info
+                epoch_time = total_time_init + time.time() - start_trn_time
                 progress_message = ProgressMessage(
                     epoch=epoch,
                     is_checkpoint=is_checkpoint,
@@ -673,11 +701,35 @@ def train(
                     samples=samples,
                     trn_loss=trn_loss,
                     val_loss=val_loss,
-                    total_time=total_time_init + time.time() - start_trn_time,
+                    total_time=epoch_time,
                     learn_rate=current_lr,
                     dp_eps=None,
                     dp_delta=None,
                 )
+                # log epoch summary
+                checkpoint_marker = " [checkpoint]" if is_checkpoint else ""
+                trn_loss_str = f"{trn_loss:.4f}" if trn_loss is not None else "N/A"
+                val_loss_str = f"{val_loss:.4f}" if val_loss is not None and not pd.isna(val_loss) else "N/A"
+                epoch_duration = time.time() - epoch_start_time
+                _LOG.info(
+                    f"epoch {int(epoch):3d} | "
+                    f"trn_loss: {trn_loss_str} | "
+                    f"val_loss: {val_loss_str} | "
+                    f"lr: {current_lr:.2e} | "
+                    f"epoch_time: {epoch_duration:.1f}s | "
+                    f"total_time: {epoch_time:.1f}s{checkpoint_marker}"
+                )
+                if on_epoch is not None:
+                    on_epoch({
+                        "epoch": int(epoch),
+                        "trn_loss": trn_loss,
+                        "val_loss": val_loss,
+                        "lr": current_lr,
+                        "epoch_time": epoch_duration,
+                        "total_time": epoch_time,
+                        "is_checkpoint": bool(is_checkpoint),
+                    })
+                epoch_start_time = time.time()
                 # check for early stopping
                 do_stop = early_stopper(val_loss=val_loss)
                 # scheduling for ReduceLROnPlateau
@@ -754,7 +806,7 @@ def train(
                 val_loss = None
             else:
                 _LOG.info("calculate validation loss")
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, device=device)
+                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, device=device, use_amp=use_amp)
             # send a final message to inform how far we've progressed
             trn_loss = _calculate_average_trn_loss(trn_sample_losses)
             progress_message = ProgressMessage(

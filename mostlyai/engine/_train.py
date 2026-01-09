@@ -41,6 +41,7 @@ def train_flat(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     enable_flexible_generation: bool = False,
+    on_epoch: "OnEpochCallback | None" = None,
 ) -> ModelArtifact:
     """
     Train a flat (non-sequential) model entirely in memory.
@@ -60,6 +61,7 @@ def train_flat(
         batch_size: Batch size (auto-determined if None)
         device: Device for training (auto-detected if None)
         enable_flexible_generation: Enable flexible column order generation
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Returns:
         ModelArtifact containing trained weights and stats
@@ -78,7 +80,7 @@ def train_flat(
         ... )
         >>> synthetic = generate_flat(artifact, sample_size=1000)
     """
-    from mostlyai.engine._tabular.training import train as train_internal
+    from mostlyai.engine._tabular.training import train as train_internal, OnEpochCallback
 
     # Validate that we have columns to train on
     if not tgt_encoding_types:
@@ -140,7 +142,9 @@ def train_flat(
     if batch_size is None:
         batch_size = min(n_train, 2048)
 
-    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False):
+    def make_batch_iter(
+        tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False
+    ):
         """Create iterator over batches from pre-loaded CPU tensors.
 
         Tensors are stored on CPU and moved to GPU per-batch to avoid VRAM exhaustion.
@@ -179,6 +183,7 @@ def train_flat(
             batch_size=batch_size,
             enable_flexible_generation=enable_flexible_generation,
             device=device,
+            on_epoch=on_epoch,
         )
 
         # Step 7: Load trained weights and create artifact
@@ -213,6 +218,7 @@ def train_sequential(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     enable_flexible_generation: bool = False,
+    on_epoch: "OnEpochCallback | None" = None,
 ) -> ModelArtifact:
     """
     Train a sequential (longitudinal) model entirely in memory.
@@ -234,6 +240,7 @@ def train_sequential(
         batch_size: Batch size (auto-determined if None)
         device: Device for training
         enable_flexible_generation: Enable flexible column order generation
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Returns:
         ModelArtifact containing trained weights and stats
@@ -251,7 +258,7 @@ def train_sequential(
         ...     ctx_encoding_types={"age": "tabular_numeric_auto"},
         ... )
     """
-    from mostlyai.engine._tabular.training import train as train_internal
+    from mostlyai.engine._tabular.training import train as train_internal, OnEpochCallback
 
     # Validate that we have target columns to train on
     if not tgt_encoding_types:
@@ -310,14 +317,24 @@ def train_sequential(
     cpu_device = torch.device("cpu")
 
     train_tensors = _encode_sequential_to_tensors(
-        train_tgt, tgt_stats, tgt_context_key,
-        train_ctx, ctx_stats, ctx_primary_key,
-        seq_len_max, cpu_device,
+        train_tgt,
+        tgt_stats,
+        tgt_context_key,
+        train_ctx,
+        ctx_stats,
+        ctx_primary_key,
+        seq_len_max,
+        cpu_device,
     )
     val_tensors = _encode_sequential_to_tensors(
-        val_tgt, tgt_stats, tgt_context_key,
-        val_ctx, ctx_stats, ctx_primary_key,
-        seq_len_max, cpu_device,
+        val_tgt,
+        tgt_stats,
+        tgt_context_key,
+        val_ctx,
+        ctx_stats,
+        ctx_primary_key,
+        seq_len_max,
+        cpu_device,
     )
 
     # Step 4: Build model config
@@ -341,7 +358,9 @@ def train_sequential(
     if batch_size is None:
         batch_size = min(n_train, 512)
 
-    def make_batch_iter(tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False):
+    def make_batch_iter(
+        tensor_dict: dict[str, torch.Tensor], batch_sz: int, target_device: torch.device, shuffle: bool = False
+    ):
         """Create iterator over batches from pre-loaded CPU tensors.
 
         Tensors are stored on CPU and moved to GPU per-batch to avoid VRAM exhaustion.
@@ -386,6 +405,7 @@ def train_sequential(
             batch_size=batch_size,
             enable_flexible_generation=enable_flexible_generation,
             device=device,
+            on_epoch=on_epoch,
         )
 
         # Step 7: Create artifact
@@ -465,12 +485,16 @@ def _encode_sequential_to_tensors(
     after encode_df() but before flatten_frame(). Since we're building tensors directly,
     we create these positional tensors here instead.
     """
-    from mostlyai.engine._tabular.common import pad_ctx_sequences
     from mostlyai.engine._common import (
-        CTXFLT, CTXSEQ, TGT,
-        SIDX_SUB_COLUMN_PREFIX, SLEN_SUB_COLUMN_PREFIX, RIDX_SUB_COLUMN_PREFIX,
+        CTXFLT,
+        CTXSEQ,
+        RIDX_SUB_COLUMN_PREFIX,
         SIDX_RIDX_DIGIT_ENCODING_THRESHOLD,
+        SIDX_SUB_COLUMN_PREFIX,
+        SLEN_SUB_COLUMN_PREFIX,
+        TGT,
     )
+    from mostlyai.engine._tabular.common import pad_ctx_sequences
 
     tensors = {}
 
@@ -487,7 +511,7 @@ def _encode_sequential_to_tensors(
     n_contexts = len(context_ids)
 
     # Calculate sequence lengths for each context (needed for positional columns)
-    seq_lengths = tgt_df.groupby(tgt_context_key).size()
+    seq_lengths = tgt_df.groupby(tgt_context_key).size().to_dict()
 
     # Group by context and pad (use the encoded context key column name)
     tgt_cols = [c for c in tgt_encoded.columns if c.startswith(TGT)]
@@ -497,19 +521,22 @@ def _encode_sequential_to_tensors(
     # (see pad_tgt_sequences in encoding.py which adds one extra row per context)
     padded_seq_len = max_seq_len + 1
 
+    # Pre-compute group indices: dict mapping ctx_id -> array of row indices
+    indices_map = tgt_grouped.indices
+
+    # Convert columns to numpy arrays for direct indexing
+    tgt_data = {col: tgt_encoded[col].to_numpy() for col in tgt_cols}
+
     for col in tgt_cols:
-        # Pre-allocate padded tensor
+        col_data = tgt_data[col]
         padded = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
 
         for i, ctx_id in enumerate(context_ids):
-            try:
-                group = tgt_grouped.get_group(ctx_id)
-                seq = group[col].to_numpy()
+            if ctx_id in indices_map:
+                indices = indices_map[ctx_id]
+                seq = col_data[indices]
                 seq_len = min(len(seq), max_seq_len)
                 padded[i, :seq_len, 0] = torch.tensor(seq[:seq_len], dtype=torch.int64, device=device)
-                # Position seq_len is the padding row (already 0 from initialization)
-            except KeyError:
-                pass  # Empty sequence
 
         tensors[col] = padded
 
@@ -577,7 +604,7 @@ def _encode_sequential_to_tensors(
         for d in range(n_digits):
             # exp is the power of 10 for this digit position (E0=ones, E1=tens, E2=hundreds)
             exp = n_digits - d - 1
-            divisor = 10 ** exp
+            divisor = 10**exp
 
             sidx_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
             slen_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)

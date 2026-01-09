@@ -36,6 +36,7 @@ import warnings
 from mostlyai.engine._artifact import ModelArtifact, minimize_stats
 from mostlyai.engine._logging import init_logging
 from mostlyai.engine._stats import compute_stats
+from mostlyai.engine._tabular.training import EpochInfo, OnEpochCallback
 from mostlyai.engine._train import train_flat, train_sequential
 from mostlyai.engine.domain import ModelEncodingType
 from mostlyai.engine.generation import generate_flat, generate_sequential
@@ -53,6 +54,8 @@ __all__ = [
     "compute_stats",
     # Types
     "ModelEncodingType",
+    "EpochInfo",
+    "OnEpochCallback",
     # Utilities
     "init_logging",
     "set_random_state",
