@@ -195,11 +195,9 @@ class _TensorIteratorWrapper:
 
 class TabularModelCheckpoint(ModelCheckpoint):
     def _save_model_weights(self, model: torch.nn.Module):
-        if isinstance(model, GradSampleModule):
-            state_dict = model._module.state_dict()
-        else:
-            state_dict = model.state_dict()
-        torch.save(state_dict, self.workspace.model_tabular_weights_path)
+        # torch.compile() wraps the model in OptimizedModule, storing the original at _orig_mod
+        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+        torch.save(unwrapped.state_dict(), self.workspace.model_tabular_weights_path)
 
     def _clear_model_weights(self) -> None:
         self.workspace.model_tabular_weights_path.unlink(missing_ok=True)
