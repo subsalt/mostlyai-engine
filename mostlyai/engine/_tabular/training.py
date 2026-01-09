@@ -209,24 +209,23 @@ class TabularModelCheckpoint(ModelCheckpoint):
 
 
 def _calculate_sample_losses(
-    model: FlatModel | SequentialModel | GradSampleModule, data: dict[str, torch.Tensor]
+    model: FlatModel | SequentialModel, data: dict[str, torch.Tensor]
 ) -> torch.Tensor:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
         output, _ = model(data, mode="trn")
     criterion = nn.CrossEntropyLoss(reduction="none")
 
-    tgt_cols = (
-        list(model.tgt_cardinalities.keys())
-        if not isinstance(model, GradSampleModule)
-        else model._module.tgt_cardinalities.keys()
-    )
-    if isinstance(model, SequentialModel) or (
-        isinstance(model, GradSampleModule) and isinstance(model._module, SequentialModel)
-    ):
+    # torch.compile() wraps the model in OptimizedModule, storing the original at _orig_mod
+    unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+    tgt_cols = list(unwrapped.tgt_cardinalities.keys())
+
+    # Detect sequential vs flat by presence of RIDX columns in data
+    ridx_cols = [k for k in data if k.startswith(RIDX_SUB_COLUMN_PREFIX)]
+    is_sequential = len(ridx_cols) > 0
+    if is_sequential:
         sidx_cols = {k for k in data if k.startswith(SIDX_SUB_COLUMN_PREFIX)}
         slen_cols = {k for k in data if k.startswith(SLEN_SUB_COLUMN_PREFIX)}
-        ridx_cols = [k for k in data if k.startswith(RIDX_SUB_COLUMN_PREFIX)]
 
         # mask for data columns
         data_mask = torch.zeros_like(data[ridx_cols[0]], dtype=torch.int64)
