@@ -41,6 +41,7 @@ def train_flat(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     enable_flexible_generation: bool = False,
+    on_epoch: "OnEpochCallback | None" = None,
 ) -> ModelArtifact:
     """
     Train a flat (non-sequential) model entirely in memory.
@@ -60,6 +61,7 @@ def train_flat(
         batch_size: Batch size (auto-determined if None)
         device: Device for training (auto-detected if None)
         enable_flexible_generation: Enable flexible column order generation
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Returns:
         ModelArtifact containing trained weights and stats
@@ -78,7 +80,7 @@ def train_flat(
         ... )
         >>> synthetic = generate_flat(artifact, sample_size=1000)
     """
-    from mostlyai.engine._tabular.training import train as train_internal
+    from mostlyai.engine._tabular.training import train as train_internal, OnEpochCallback
 
     # Validate that we have columns to train on
     if not tgt_encoding_types:
@@ -181,6 +183,7 @@ def train_flat(
             batch_size=batch_size,
             enable_flexible_generation=enable_flexible_generation,
             device=device,
+            on_epoch=on_epoch,
         )
 
         # Step 7: Load trained weights and create artifact
@@ -215,6 +218,7 @@ def train_sequential(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     enable_flexible_generation: bool = False,
+    on_epoch: "OnEpochCallback | None" = None,
 ) -> ModelArtifact:
     """
     Train a sequential (longitudinal) model entirely in memory.
@@ -236,6 +240,7 @@ def train_sequential(
         batch_size: Batch size (auto-determined if None)
         device: Device for training
         enable_flexible_generation: Enable flexible column order generation
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Returns:
         ModelArtifact containing trained weights and stats
@@ -253,7 +258,7 @@ def train_sequential(
         ...     ctx_encoding_types={"age": "tabular_numeric_auto"},
         ... )
     """
-    from mostlyai.engine._tabular.training import train as train_internal
+    from mostlyai.engine._tabular.training import train as train_internal, OnEpochCallback
 
     # Validate that we have target columns to train on
     if not tgt_encoding_types:
@@ -400,6 +405,7 @@ def train_sequential(
             batch_size=batch_size,
             enable_flexible_generation=enable_flexible_generation,
             device=device,
+            on_epoch=on_epoch,
         )
 
         # Step 7: Create artifact

@@ -18,7 +18,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from importlib.metadata import version
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -95,6 +95,21 @@ class ModelConfig(TypedDict, total=False):
 
     empirical_probs: dict[str, list[float]] | None
     """Empirical probabilities for predictor initialization (optional, improves convergence)"""
+
+
+class EpochInfo(TypedDict):
+    """Information passed to on_epoch callback after each training epoch."""
+
+    epoch: int
+    trn_loss: float | None
+    val_loss: float | None
+    lr: float
+    epoch_time: float
+    total_time: float
+    is_checkpoint: bool
+
+
+OnEpochCallback: TypeAlias = Callable[[EpochInfo], None]
 
 
 ##################
@@ -316,6 +331,7 @@ def train(
     model_state_strategy: ModelStateStrategy | str = ModelStateStrategy.reset,
     device: torch.device | str | None = None,
     update_progress: ProgressCallback | None = None,
+    on_epoch: OnEpochCallback | None = None,
 ):
     """
     Train a TabularARGN model from pre-computed tensor batches.
@@ -339,6 +355,7 @@ def train(
         model_state_strategy: How to handle existing model state
         device: Device for training (auto-detected if None)
         update_progress: Progress callback
+        on_epoch: Callback invoked after each epoch with EpochInfo dict
 
     Example:
         >>> from mostlyai.engine import train, build_model_config, prepare_flat_batch
@@ -702,6 +719,16 @@ def train(
                     f"epoch_time: {epoch_duration:.1f}s | "
                     f"total_time: {epoch_time:.1f}s{checkpoint_marker}"
                 )
+                if on_epoch is not None:
+                    on_epoch({
+                        "epoch": int(epoch),
+                        "trn_loss": trn_loss,
+                        "val_loss": val_loss,
+                        "lr": current_lr,
+                        "epoch_time": epoch_duration,
+                        "total_time": epoch_time,
+                        "is_checkpoint": bool(is_checkpoint),
+                    })
                 epoch_start_time = time.time()
                 # check for early stopping
                 do_stop = early_stopper(val_loss=val_loss)
