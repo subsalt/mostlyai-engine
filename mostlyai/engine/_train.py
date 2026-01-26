@@ -506,39 +506,51 @@ def _encode_sequential_to_tensors(
         n_jobs=1,
     )
 
-    # Get unique contexts in order
+    # Get unique contexts in order of first appearance
     context_ids = tgt_df[tgt_context_key].unique()
     n_contexts = len(context_ids)
 
-    # Calculate sequence lengths for each context (needed for positional columns)
-    seq_lengths = tgt_df.groupby(tgt_context_key).size().to_dict()
+    # Create mapping from context_id to context index (0, 1, 2, ...)
+    ctx_id_to_idx = {ctx_id: idx for idx, ctx_id in enumerate(context_ids)}
 
-    # Group by context and pad (use the encoded context key column name)
-    tgt_cols = [c for c in tgt_encoded.columns if c.startswith(TGT)]
-    tgt_grouped = tgt_encoded.groupby(encoded_context_key, sort=False)
+    # Map each row to its context index
+    row_ctx_indices = tgt_encoded[encoded_context_key].map(ctx_id_to_idx).to_numpy()
 
-    # +1 accounts for the padding row added per sequence in the original implementation
-    # (see pad_tgt_sequences in encoding.py which adds one extra row per context)
+    # Calculate position of each row within its context (0, 1, 2, ... for each context)
+    positions_within_ctx = tgt_encoded.groupby(encoded_context_key, sort=False).cumcount().to_numpy()
+
+    # Get sequence lengths for each context (capped at max_seq_len)
+    seq_lengths_series = tgt_df.groupby(tgt_context_key).size()
+    seq_lengths_arr = np.array([min(seq_lengths_series.get(ctx_id, 0), max_seq_len) for ctx_id in context_ids])
+
+    # +1 accounts for the padding row added per sequence
     padded_seq_len = max_seq_len + 1
 
-    # Pre-compute group indices: dict mapping ctx_id -> array of row indices
-    indices_map = tgt_grouped.indices
+    # Get target columns
+    tgt_cols = [c for c in tgt_encoded.columns if c.startswith(TGT)]
 
-    # Convert columns to numpy arrays for direct indexing
-    tgt_data = {col: tgt_encoded[col].to_numpy() for col in tgt_cols}
+    # ==========================================================================
+    # VECTORIZED: Fill all columns using advanced indexing
+    # ==========================================================================
+    # Instead of: for col in cols: for i, ctx in enumerate(contexts): ...
+    # We use: padded[row_ctx_indices, positions_within_ctx] = values
 
     for col in tgt_cols:
-        col_data = tgt_data[col]
-        padded = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
+        col_data = tgt_encoded[col].to_numpy()
 
-        for i, ctx_id in enumerate(context_ids):
-            if ctx_id in indices_map:
-                indices = indices_map[ctx_id]
-                seq = col_data[indices]
-                seq_len = min(len(seq), max_seq_len)
-                padded[i, :seq_len, 0] = torch.tensor(seq[:seq_len], dtype=torch.int64, device=device)
+        # Create padded array on CPU first, then convert to tensor
+        padded = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
 
-        tensors[col] = padded
+        # Only include rows where position < max_seq_len
+        valid_mask = positions_within_ctx < max_seq_len
+        valid_ctx_indices = row_ctx_indices[valid_mask]
+        valid_positions = positions_within_ctx[valid_mask]
+        valid_values = col_data[valid_mask]
+
+        # Vectorized assignment using advanced indexing
+        padded[valid_ctx_indices, valid_positions, 0] = valid_values
+
+        tensors[col] = torch.tensor(padded, dtype=torch.int64, device=device)
 
     # ==========================================================================
     # Add positional columns (sidx, slen, ridx)
@@ -573,63 +585,51 @@ def _encode_sequential_to_tensors(
 
     if max_seq_len < SIDX_RIDX_DIGIT_ENCODING_THRESHOLD:
         # Short sequences: single categorical column per positional encoding
-        sidx_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
-        slen_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
-        ridx_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
+        sidx_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
+        slen_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
+        ridx_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
 
-        for i, ctx_id in enumerate(context_ids):
-            actual_len = seq_lengths.get(ctx_id, 0)
-            seq_len = min(actual_len, max_seq_len)
-
+        for i in range(n_contexts):
+            seq_len = seq_lengths_arr[i]
             if seq_len > 0:
-                # Include the padding row at position seq_len
-                # Total positions filled: seq_len + 1 (indices 0 through seq_len inclusive)
                 padded_len = seq_len + 1
+                # sidx: 0, 1, 2, ..., seq_len
+                sidx_arr[i, :padded_len, 0] = np.arange(padded_len)
+                # slen: seq_len for all positions
+                slen_arr[i, :padded_len, 0] = seq_len
+                # ridx: seq_len, seq_len-1, ..., 1, 0
+                ridx_arr[i, :padded_len, 0] = np.arange(seq_len, -1, -1)
 
-                # sidx: 0, 1, 2, ..., seq_len (position from start, including padding row)
-                sidx_tensor[i, :padded_len, 0] = torch.arange(padded_len, dtype=torch.int64, device=device)
-                # slen: original sequence length for all positions (including padding row)
-                slen_tensor[i, :padded_len, 0] = seq_len
-                # ridx: seq_len, seq_len-1, ..., 1, 0 (padding row has ridx=0)
-                ridx_tensor[i, :padded_len, 0] = torch.arange(seq_len, -1, -1, dtype=torch.int64, device=device)
-
-        tensors[f"{SIDX_SUB_COLUMN_PREFIX}cat"] = sidx_tensor
-        tensors[f"{SLEN_SUB_COLUMN_PREFIX}cat"] = slen_tensor
-        tensors[f"{RIDX_SUB_COLUMN_PREFIX}cat"] = ridx_tensor
+        tensors[f"{SIDX_SUB_COLUMN_PREFIX}cat"] = torch.tensor(sidx_arr, dtype=torch.int64, device=device)
+        tensors[f"{SLEN_SUB_COLUMN_PREFIX}cat"] = torch.tensor(slen_arr, dtype=torch.int64, device=device)
+        tensors[f"{RIDX_SUB_COLUMN_PREFIX}cat"] = torch.tensor(ridx_arr, dtype=torch.int64, device=device)
     else:
         # Long sequences: digit encoding (each digit position is a separate column)
         # E.g., for max_seq_len=150, we get E2, E1, E0 columns representing hundreds, tens, ones
         n_digits = len(str(max_seq_len))
 
         for d in range(n_digits):
-            # exp is the power of 10 for this digit position (E0=ones, E1=tens, E2=hundreds)
             exp = n_digits - d - 1
             divisor = 10**exp
 
-            sidx_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
-            slen_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
-            ridx_tensor = torch.zeros((n_contexts, padded_seq_len, 1), dtype=torch.int64, device=device)
+            sidx_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
+            slen_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
+            ridx_arr = np.zeros((n_contexts, padded_seq_len, 1), dtype=np.int64)
 
-            for i, ctx_id in enumerate(context_ids):
-                actual_len = seq_lengths.get(ctx_id, 0)
-                seq_len = min(actual_len, max_seq_len)
-
+            for i in range(n_contexts):
+                seq_len = seq_lengths_arr[i]
                 if seq_len > 0:
-                    # Include the padding row at position seq_len
                     padded_len = seq_len + 1
+                    sidx_vals = np.arange(padded_len)
+                    ridx_vals = np.arange(seq_len, -1, -1)
 
-                    sidx_vals = torch.arange(padded_len, dtype=torch.int64, device=device)
-                    slen_val = seq_len  # original sequence length
-                    ridx_vals = torch.arange(seq_len, -1, -1, dtype=torch.int64, device=device)
+                    sidx_arr[i, :padded_len, 0] = (sidx_vals // divisor) % 10
+                    slen_arr[i, :padded_len, 0] = (seq_len // divisor) % 10
+                    ridx_arr[i, :padded_len, 0] = (ridx_vals // divisor) % 10
 
-                    # Extract the digit at this position: (value // 10^exp) % 10
-                    sidx_tensor[i, :padded_len, 0] = (sidx_vals // divisor) % 10
-                    slen_tensor[i, :padded_len, 0] = (slen_val // divisor) % 10
-                    ridx_tensor[i, :padded_len, 0] = (ridx_vals // divisor) % 10
-
-            tensors[f"{SIDX_SUB_COLUMN_PREFIX}E{exp}"] = sidx_tensor
-            tensors[f"{SLEN_SUB_COLUMN_PREFIX}E{exp}"] = slen_tensor
-            tensors[f"{RIDX_SUB_COLUMN_PREFIX}E{exp}"] = ridx_tensor
+            tensors[f"{SIDX_SUB_COLUMN_PREFIX}E{exp}"] = torch.tensor(sidx_arr, dtype=torch.int64, device=device)
+            tensors[f"{SLEN_SUB_COLUMN_PREFIX}E{exp}"] = torch.tensor(slen_arr, dtype=torch.int64, device=device)
+            tensors[f"{RIDX_SUB_COLUMN_PREFIX}E{exp}"] = torch.tensor(ridx_arr, dtype=torch.int64, device=device)
 
     # Encode context data if provided
     if ctx_df is not None and ctx_stats is not None:
@@ -641,8 +641,8 @@ def _encode_sequential_to_tensors(
         )
 
         # Reorder to match target context order
-        ctx_id_to_idx = {cid: i for i, cid in enumerate(ctx_df[ctx_primary_key])}
-        ctx_order = [ctx_id_to_idx.get(cid, 0) for cid in context_ids]
+        ctx_id_to_idx_map = {cid: i for i, cid in enumerate(ctx_df[ctx_primary_key])}
+        ctx_order = [ctx_id_to_idx_map.get(cid, 0) for cid in context_ids]
 
         ctx_encoded = pad_ctx_sequences(ctx_encoded)
 
