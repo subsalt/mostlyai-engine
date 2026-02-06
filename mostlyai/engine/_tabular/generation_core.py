@@ -28,7 +28,6 @@ from mostlyai.engine._common import (
     SDEC_SUB_COLUMN_PREFIX,
     SIDX_SUB_COLUMN_PREFIX,
     SLEN_SUB_COLUMN_PREFIX,
-    decode_positional_column,
     encode_positional_column,
     get_argn_name,
     get_columns_from_cardinalities,
@@ -612,29 +611,6 @@ def _build_positional_fixed_values(
     return fixed_values
 
 
-def _compute_sequence_continue_mask(
-    out_df: pd.DataFrame,
-    n_seed_steps: int,
-) -> pd.Series:
-    """
-    Compute mask for which sequences should continue to next step.
-
-    Returns True for sequences that haven't reached their predicted length.
-    Always includes seeded steps regardless of predicted length.
-    """
-    if RIDX_SUB_COLUMN_PREFIX in out_df.columns:
-        # RIDX > 0 means more steps remaining
-        include_mask = out_df[RIDX_SUB_COLUMN_PREFIX] > 0
-    else:
-        # Fallback: SIDX < SLEN means we haven't reached the end
-        include_mask = out_df[SIDX_SUB_COLUMN_PREFIX] < out_df[SLEN_SUB_COLUMN_PREFIX]
-
-    # Always include seeded steps
-    include_mask = include_mask | (out_df[SIDX_SUB_COLUMN_PREFIX] < n_seed_steps)
-
-    return include_mask
-
-
 def _filter_sequence_state(
     include_mask: pd.Series,
     context: list | None,
@@ -806,10 +782,26 @@ def _decode_and_filter_step_gpu(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
-    GPU-optimized version of positional decoding and sequence filtering.
+    GPU-accelerated positional decoding and sequence filtering.
+
+    This function replaces the CPU-bound pandas operations with GPU tensor operations:
+    - Decodes SIDX/SLEN/RIDX positional columns on GPU
+    - Computes sequence continuation mask on GPU
+    - Filters tensors on GPU using boolean indexing
+
+    Args:
+        out_pt: Model output tensor (batch, n_sub_cols, 1)
+        tgt_sub_columns: List of sub-column names
+        seq_len_max: Maximum sequence length
+        seq_len_min: Minimum sequence length
+        n_seed_steps: Number of seed steps
+        seq_step: Current sequence step
+        has_slen: Whether SLEN columns are present
+        has_ridx: Whether RIDX columns are present
+        device: Torch device
 
     Returns:
-        (filtered_tensor, include_mask, next_step_size, sidx, slen, ridx)
+        Tuple of (filtered_tensor, include_mask, next_step_size, sidx, slen, ridx)
     """
     from mostlyai.engine._common import SIDX_RIDX_DIGIT_ENCODING_THRESHOLD
 
@@ -1076,7 +1068,7 @@ def generate_sequential_core(
 
             out_pt = torch.stack(list(out_dct.values()), dim=0).transpose(0, 1)
 
-            # GPU-optimized: Decode and filter on GPU, defer pandas conversion
+            # Decode positional columns and compute mask on GPU
             (
                 filtered_pt,
                 include_mask,
@@ -1096,15 +1088,15 @@ def generate_sequential_core(
                 device=device,
             )
 
-            # Create minimal DataFrame with decoded positional columns for next iteration
-            # (needed by _build_positional_fixed_values)
-            out_df = pd.DataFrame({
-                SIDX_SUB_COLUMN_PREFIX: sidx_decoded.cpu().numpy(),
-            })
+            # Create minimal DataFrame with only decoded positional columns
+            # This is needed by _build_positional_fixed_values in the next iteration
+            # We only transfer the decoded scalars to CPU, not the full tensor
+            out_df_data = {SIDX_SUB_COLUMN_PREFIX: sidx_decoded.cpu().numpy()}
             if has_slen and slen_decoded is not None:
-                out_df[SLEN_SUB_COLUMN_PREFIX] = slen_decoded.cpu().numpy()
+                out_df_data[SLEN_SUB_COLUMN_PREFIX] = slen_decoded.cpu().numpy()
             if has_ridx and ridx_decoded is not None:
-                out_df[RIDX_SUB_COLUMN_PREFIX] = ridx_decoded.cpu().numpy()
+                out_df_data[RIDX_SUB_COLUMN_PREFIX] = ridx_decoded.cpu().numpy()
+            out_df = pd.DataFrame(out_df_data)
 
             # Filter for next iteration (must happen BEFORE storing results to match legacy behavior)
             # The include_mask determines which sequences should CONTINUE to the next step.

@@ -41,9 +41,11 @@ def decode_positional_column_torch(
         # Categorical encoding - single column
         # For single column, encoded_tensor should be 1D or we take the first column
         if encoded_tensor.dim() == 1:
-            return encoded_tensor
+            result = encoded_tensor
         else:
-            return encoded_tensor[:, 0]
+            result = encoded_tensor[:, 0]
+        # Convert to long for consistency with digit encoding
+        return result.long()
     else:
         # Digit encoding - reconstruct from digit columns
         if sub_column_indices is None:
