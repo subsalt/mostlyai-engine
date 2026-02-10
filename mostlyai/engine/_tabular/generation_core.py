@@ -28,7 +28,6 @@ from mostlyai.engine._common import (
     SDEC_SUB_COLUMN_PREFIX,
     SIDX_SUB_COLUMN_PREFIX,
     SLEN_SUB_COLUMN_PREFIX,
-    decode_positional_column,
     encode_positional_column,
     get_argn_name,
     get_columns_from_cardinalities,
@@ -46,6 +45,10 @@ from mostlyai.engine._encoding_types.tabular.numeric import (
 )
 from mostlyai.engine._tabular.argn import FlatModel, ModelSize, SequentialModel
 from mostlyai.engine._tabular.encoding import encode_df
+from mostlyai.engine._tabular.generation_gpu import (
+    compute_sequence_continue_mask_torch,
+    decode_positional_column_torch,
+)
 from mostlyai.engine.domain import ModelEncodingType
 
 _LOG = logging.getLogger(__name__)
@@ -608,29 +611,6 @@ def _build_positional_fixed_values(
     return fixed_values
 
 
-def _compute_sequence_continue_mask(
-    out_df: pd.DataFrame,
-    n_seed_steps: int,
-) -> pd.Series:
-    """
-    Compute mask for which sequences should continue to next step.
-
-    Returns True for sequences that haven't reached their predicted length.
-    Always includes seeded steps regardless of predicted length.
-    """
-    if RIDX_SUB_COLUMN_PREFIX in out_df.columns:
-        # RIDX > 0 means more steps remaining
-        include_mask = out_df[RIDX_SUB_COLUMN_PREFIX] > 0
-    else:
-        # Fallback: SIDX < SLEN means we haven't reached the end
-        include_mask = out_df[SIDX_SUB_COLUMN_PREFIX] < out_df[SLEN_SUB_COLUMN_PREFIX]
-
-    # Always include seeded steps
-    include_mask = include_mask | (out_df[SIDX_SUB_COLUMN_PREFIX] < n_seed_steps)
-
-    return include_mask
-
-
 def _filter_sequence_state(
     include_mask: pd.Series,
     context: list | None,
@@ -783,6 +763,126 @@ def _restore_seed_values_sequential(
             decoded_df.loc[seed_rows.values, col] = df_overwrite.loc[seed_rows, col].values
 
     return decoded_df.drop(columns=["__SEQ_IDX"])
+
+
+# ==============================================================================
+# GPU-Optimized Helper Functions
+# ==============================================================================
+
+
+def _decode_and_filter_step_gpu(
+    out_pt: torch.Tensor,
+    tgt_sub_columns: list[str],
+    seq_len_max: int,
+    seq_len_min: int,
+    n_seed_steps: int,
+    seq_step: int,
+    has_slen: bool,
+    has_ridx: bool,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """
+    GPU-accelerated positional decoding and sequence filtering.
+
+    This function replaces the CPU-bound pandas operations with GPU tensor operations:
+    - Decodes SIDX/SLEN/RIDX positional columns on GPU
+    - Computes sequence continuation mask on GPU
+    - Filters tensors on GPU using boolean indexing
+
+    Args:
+        out_pt: Model output tensor (batch, n_sub_cols, 1)
+        tgt_sub_columns: List of sub-column names
+        seq_len_max: Maximum sequence length
+        seq_len_min: Minimum sequence length
+        n_seed_steps: Number of seed steps
+        seq_step: Current sequence step
+        has_slen: Whether SLEN columns are present
+        has_ridx: Whether RIDX columns are present
+        device: Torch device
+
+    Returns:
+        Tuple of (filtered_tensor, include_mask, next_step_size, sidx, slen, ridx)
+    """
+    from mostlyai.engine._common import SIDX_RIDX_DIGIT_ENCODING_THRESHOLD
+
+    # Build sub-column index mapping
+    sub_col_idx = {name: idx for idx, name in enumerate(tgt_sub_columns)}
+
+    # Decode SIDX
+    if seq_len_max < SIDX_RIDX_DIGIT_ENCODING_THRESHOLD:
+        # Categorical encoding - find the cat column
+        sidx_idx = None
+        for name, idx in sub_col_idx.items():
+            if name.startswith(SIDX_SUB_COLUMN_PREFIX) and name.endswith("cat"):
+                sidx_idx = idx
+                break
+        sidx = out_pt[:, sidx_idx, 0] if sidx_idx is not None else torch.zeros(out_pt.size(0), device=device)
+    else:
+        # Digit encoding
+        sidx = decode_positional_column_torch(
+            out_pt.squeeze(-1),
+            seq_len_max,
+            SIDX_SUB_COLUMN_PREFIX,
+            sub_col_idx,
+        )
+
+    # Decode SLEN if present
+    slen = None
+    if has_slen:
+        if seq_len_max < SIDX_RIDX_DIGIT_ENCODING_THRESHOLD:
+            slen_idx = None
+            for name, idx in sub_col_idx.items():
+                if name.startswith(SLEN_SUB_COLUMN_PREFIX) and name.endswith("cat"):
+                    slen_idx = idx
+                    break
+            if slen_idx is not None:
+                slen = out_pt[:, slen_idx, 0]
+                slen = torch.clamp(slen, min=seq_len_min)
+        else:
+            slen = decode_positional_column_torch(
+                out_pt.squeeze(-1),
+                seq_len_max,
+                SLEN_SUB_COLUMN_PREFIX,
+                sub_col_idx,
+            )
+            slen = torch.clamp(slen, min=seq_len_min)
+
+    # Decode RIDX if present
+    ridx = None
+    if has_ridx:
+        if seq_len_max < SIDX_RIDX_DIGIT_ENCODING_THRESHOLD:
+            ridx_idx = None
+            for name, idx in sub_col_idx.items():
+                if name.startswith(RIDX_SUB_COLUMN_PREFIX) and name.endswith("cat"):
+                    ridx_idx = idx
+                    break
+            if ridx_idx is not None:
+                ridx = out_pt[:, ridx_idx, 0]
+                ridx = torch.clamp(ridx, min=seq_len_min - seq_step, max=seq_len_max)
+        else:
+            ridx = decode_positional_column_torch(
+                out_pt.squeeze(-1),
+                seq_len_max,
+                RIDX_SUB_COLUMN_PREFIX,
+                sub_col_idx,
+            )
+            ridx = torch.clamp(ridx, min=seq_len_min - seq_step, max=seq_len_max)
+
+    # Create dummy slen if not present (for mask computation)
+    if slen is None:
+        slen = sidx + 1
+
+    # Compute continue mask
+    include_mask = compute_sequence_continue_mask_torch(sidx, slen, ridx, n_seed_steps)
+
+    # Filter tensor
+    next_step_size = include_mask.sum().item()
+    if next_step_size < out_pt.size(0):
+        filtered_tensor = out_pt[include_mask]
+    else:
+        filtered_tensor = out_pt
+
+    return filtered_tensor, include_mask, next_step_size, sidx, slen, ridx
 
 
 # ==============================================================================
@@ -968,33 +1068,57 @@ def generate_sequential_core(
 
             out_pt = torch.stack(list(out_dct.values()), dim=0).transpose(0, 1)
 
-            # Decode positional columns to determine which sequences continue
-            out_df = _reshape_pt_to_pandas([out_pt], tgt_sub_columns, [step_ctx_keys], tgt_context_key)
-            out_df[SIDX_SUB_COLUMN_PREFIX] = decode_positional_column(out_df, seq_len_max, SIDX_SUB_COLUMN_PREFIX)
-            if has_slen:
-                out_df[SLEN_SUB_COLUMN_PREFIX] = decode_positional_column(out_df, seq_len_max, SLEN_SUB_COLUMN_PREFIX)
-                out_df[SLEN_SUB_COLUMN_PREFIX] = out_df[SLEN_SUB_COLUMN_PREFIX].clip(lower=seq_len_min)
-            if has_ridx:
-                out_df[RIDX_SUB_COLUMN_PREFIX] = decode_positional_column(out_df, seq_len_max, RIDX_SUB_COLUMN_PREFIX)
-                out_df[RIDX_SUB_COLUMN_PREFIX] = out_df[RIDX_SUB_COLUMN_PREFIX].clip(lower=seq_len_min - seq_step, upper=seq_len_max)
+            # Decode positional columns and compute mask on GPU
+            (
+                filtered_pt,
+                include_mask,
+                next_step_size,
+                sidx_decoded,
+                slen_decoded,
+                ridx_decoded,
+            ) = _decode_and_filter_step_gpu(
+                out_pt=out_pt,
+                tgt_sub_columns=tgt_sub_columns,
+                seq_len_max=seq_len_max,
+                seq_len_min=seq_len_min,
+                n_seed_steps=n_seed_steps,
+                seq_step=seq_step,
+                has_slen=has_slen,
+                has_ridx=has_ridx,
+                device=device,
+            )
 
-            include_mask = _compute_sequence_continue_mask(out_df, n_seed_steps)
-            next_step_size = include_mask.sum()
+            # Create minimal DataFrame with only decoded positional columns
+            # This is needed by _build_positional_fixed_values in the next iteration
+            # We only transfer the decoded scalars to CPU, not the full tensor
+            out_df_data = {SIDX_SUB_COLUMN_PREFIX: sidx_decoded.cpu().numpy()}
+            if has_slen and slen_decoded is not None:
+                out_df_data[SLEN_SUB_COLUMN_PREFIX] = slen_decoded.cpu().numpy()
+            if has_ridx and ridx_decoded is not None:
+                out_df_data[RIDX_SUB_COLUMN_PREFIX] = ridx_decoded.cpu().numpy()
+            out_df = pd.DataFrame(out_df_data)
 
             # Filter for next iteration (must happen BEFORE storing results to match legacy behavior)
             # The include_mask determines which sequences should CONTINUE to the next step.
             # Sequences with RIDX=0 have completed and should NOT be included in this step's output.
             if step_size > next_step_size or next_step_size == 0:
                 step_size = next_step_size
-                step_ctx_keys = step_ctx_keys[include_mask.values].reset_index(drop=True)
-                out_df = out_df[include_mask.values].reset_index(drop=True)
-                out_pt = out_pt[include_mask.values, ...]
+                # Convert mask to pandas for compatibility with step_ctx_keys filtering
+                include_mask_cpu = include_mask.cpu().numpy()
+                step_ctx_keys = step_ctx_keys[include_mask_cpu].reset_index(drop=True)
+                out_df = out_df[include_mask_cpu].reset_index(drop=True)
+                out_pt = filtered_pt
                 if len(seed_step) > 0:
                     seed_step = seed_step[seed_step[tgt_context_key].isin(step_ctx_keys)].reset_index(drop=True)
                 if step_size > 0:
+                    # For _filter_sequence_state, create a pandas Series wrapper
+                    include_mask_series = pd.Series(include_mask_cpu)
                     context, history, history_state = _filter_sequence_state(
-                        include_mask, context, history, history_state
+                        include_mask_series, context, history, history_state
                     )
+            else:
+                out_df = out_df[include_mask.cpu().numpy()].reset_index(drop=True)
+                out_pt = filtered_pt
 
             # Store results AFTER filtering (to exclude sequences that ended this step)
             all_step_tensors.append(out_pt)
